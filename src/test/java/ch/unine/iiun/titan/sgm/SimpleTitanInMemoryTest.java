@@ -7,40 +7,42 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.fail;
 
-import java.io.BufferedReader;
-import java.io.File;
 import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.io.IOException;
-import java.util.Iterator;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import org.apache.commons.configuration.BaseConfiguration;
+import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
-import org.joda.time.Duration;
-import org.joda.time.format.PeriodFormatter;
-import org.joda.time.format.PeriodFormatterBuilder;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.thinkaurelius.titan.core.Cardinality;
 import com.thinkaurelius.titan.core.TitanFactory;
 import com.thinkaurelius.titan.core.TitanGraph;
 import com.thinkaurelius.titan.core.TitanVertex;
+import com.thinkaurelius.titan.core.schema.SchemaStatus;
 import com.thinkaurelius.titan.core.schema.TitanManagement;
+import com.thinkaurelius.titan.graphdb.database.management.ManagementSystem;
 
 /**
  * Mostly rough tests to play with the TitanDB Java APIs, nothing smart going on
  * here.
  * 
  */
-public class SimpleTitanTest {
+public class SimpleTitanInMemoryTest {
 
 	/**
 	 * Total number of edges in the WikiVote graph.
 	 */
 	private static final double WIKIVOTE_TOTAL_EDGES = 103689.0;
 	TitanGraph inmemory;
-	TitanGraph berkelyje;
+	LineConsumer lc;
 
 	/**
 	 * @see com.thinkaurelius.titan.graphdb.TitanGraphBaseTest#setUp()
@@ -48,10 +50,9 @@ public class SimpleTitanTest {
 	@Before
 	public void setUp() throws Exception {
 		this.inmemory = TitanFactory.open("inmemory");
-		this.berkelyje = TitanFactory.open("berkeleyje:/tmp/graph");
-
+		this.lc = new LineConsumer(inmemory);
 		assertNotNull(inmemory);
-		assertNotNull(berkelyje);
+
 	}
 
 	@Test
@@ -65,9 +66,23 @@ public class SimpleTitanTest {
 	@Test
 	public void testPopulateInMemoryGraphWikiVote()
 			throws FileNotFoundException, IOException {
+
 		TitanManagement mgmt = inmemory.openManagement();
-		mgmt.makePropertyKey("name").dataType(String.class);
+		mgmt.makePropertyKey("vertexId").dataType(String.class)
+				.cardinality(Cardinality.SINGLE).make();
+
+		mgmt.buildIndex("byVertexId", Vertex.class)
+				.addKey(mgmt.getOrCreatePropertyKey("vertexId"))
+				.buildCompositeIndex();
+
 		mgmt.commit();
+
+		try { // wait 'byVertexId' index
+			ManagementSystem.awaitGraphIndexStatus(inmemory, "byVertexId")
+					.status(SchemaStatus.ENABLED).call();
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
 
 		loadWikiVote(inmemory);
 
@@ -84,7 +99,8 @@ public class SimpleTitanTest {
 		TitanGraph inmemoryBatch = TitanFactory.open(bc);
 		assertNotNull(inmemoryBatch);
 		TitanManagement mgmt = inmemoryBatch.openManagement();
-		mgmt.makePropertyKey("name").dataType(String.class);
+		mgmt.makePropertyKey("vertexId").dataType(String.class)
+				.cardinality(Cardinality.SINGLE).make();
 		mgmt.commit();
 		loadWikiVote(inmemoryBatch);
 
@@ -92,11 +108,6 @@ public class SimpleTitanTest {
 
 	@After
 	public void tearDown() {
-		try {
-			berkelyje.close();
-		} catch (Exception e) {
-			fail("can't close berkeleyje");
-		}
 
 		try {
 			inmemory.close();
@@ -112,66 +123,52 @@ public class SimpleTitanTest {
 
 		long start = System.currentTimeMillis();
 
-		File f = new File("graphs/wiki-Vote.txt");
-		try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-			for (String line; (line = br.readLine()) != null;) {
-				if (!line.startsWith("#")) {
-					// System.out.println(line);
-					final String[] edgeVertices = line.split("\t");
-					Vertex fromVertex = getOrCreate(inmemory, edgeVertices[0]);
-					Vertex dest = getOrCreate(inmemory, edgeVertices[1]);
-					fromVertex.addEdge("votesFor", dest);
-					// System.out.println("Added edges:" + edgesCounter++);
-					edgesCounter++;
-					if (edgesCounter % 100 == 0) {
-						String progress = String.format("%.2f",
-								edgesCounter / WIKIVOTE_TOTAL_EDGES) + " %";
-
-						System.out.println("Added edges:" + edgesCounter + " "
-								+ durationSince(start,
-										System.currentTimeMillis())
-								+ " " + progress);
-					}
-				}
-
-			}
-
+		Path path = Paths.get("graphs/", "wiki-Vote.txt");
+		// The stream hence file will also be closed here
+		try (Stream<String> lines = Files.lines(path)) {
+			lines.filter(s -> !s.startsWith("#")).forEach(this.lc);
 		}
+		System.out.println("added all edges");
+		// edgesCounter++;
+
+		// String progress = String.format("%.2f",
+		// edgesCounter / WIKIVOTE_TOTAL_EDGES) + " %";
+
+		// System.out.println("Added edges:" + edgesCounter + " "
+		// + Utils.durationSince(start, System.currentTimeMillis()) + " "
+		// + progress);
+
 		long stop = System.currentTimeMillis();
 
 		System.out.println("Total edges:" + edgesCounter);
-		System.out.println("Elapsed time: " + durationSince(start, stop));
+		System.out.println("Elapsed time: " + Utils.durationSince(start, stop));
 
 		assertEquals((int) WIKIVOTE_TOTAL_EDGES, edgesCounter);
 	}
 
-	private String durationSince(long start, long stop) {
-		Duration duration = new Duration(start, stop);
+	private class LineConsumer implements Consumer<String> {
 
-		PeriodFormatter formatter = new PeriodFormatterBuilder().appendDays()
-				.appendSuffix("d").appendHours().appendSuffix("h")
-				.appendMinutes().appendSuffix("m").appendSeconds()
-				.appendSuffix("s").toFormatter();
-		String formatted = formatter.print(duration.toPeriod());
+		private final TitanGraph g;
 
-		return formatted;
+		public LineConsumer(TitanGraph g) {
+			this.g = g;
+		}
+
+		@Override
+		public void accept(String t) {
+			final String[] edgeVertices = t.split("\t");
+			Vertex fromVertex = getOrCreate(this.g, edgeVertices[0]);
+			Vertex dest = getOrCreate(this.g, edgeVertices[1]);
+			fromVertex.addEdge("votesFor", dest);
+		}
+
 	}
 
-	private Vertex getOrCreate(TitanGraph g, String vertexId) {
-		Iterator<Vertex> vertices = g.vertices();
-		if (!vertices.hasNext()) { // empty graph?
-			Vertex v = g.addVertex("id", vertexId);
-			return v;
-		} else
-			while (vertices.hasNext()) {
-				Vertex nextVertex = vertices.next();
-				if (nextVertex.property("id").equals(vertexId)) {
-					return nextVertex;
-				} else {
-					Vertex v = g.addVertex("id", vertexId);
-					return v;
-				}
-			}
-		return null;
+	private Vertex getOrCreate(TitanGraph graph, String vertexId) {
+
+		GraphTraversalSource g = graph.traversal();
+		return g.V().has("uniqueId", vertexId).tryNext()
+				.orElseGet(() -> graph.addVertex("uniqueId", vertexId));
+
 	}
 }
